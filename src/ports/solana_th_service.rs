@@ -1,16 +1,13 @@
 use std::str::FromStr;
-use chrono::{DateTime, TimeZone, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use chrono::{TimeZone, Utc};
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcTransactionConfig;
 use solana_sdk::account_info::AccountInfo;
 use solana_sdk::clock::Epoch;
 use solana_sdk::commitment_config::CommitmentConfig;
-use solana_sdk::message;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, TransactionStatusMeta, UiCompiledInstruction, UiMessage, UiRawMessage, UiTransactionEncoding, UiTransactionStatusMeta, UiTransactionTokenBalance};
+use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiMessage, UiRawMessage, UiTransactionEncoding};
 use solana_transaction_status::option_serializer::OptionSerializer;
 use spl_token::solana_program::program_pack::Pack;
 use crate::domain::TransactionRecord;
@@ -18,7 +15,7 @@ use crate::domain::TransactionRecord;
 pub struct SolanaTHService;
 
 impl SolanaTHService {
-    pub fn fetch_transactions(pubkey: Pubkey) -> Vec<TransactionRecord> {
+    pub fn fetch_transactions(pubkey: Pubkey, operation_limit: usize) -> Vec<TransactionRecord> {
         let rpc_url = "https://api.mainnet-beta.solana.com";
 
         let client = RpcClient::new(rpc_url);
@@ -29,9 +26,10 @@ impl SolanaTHService {
 
         let mut records = Vec::new();
 
-        log::info!("Number of signatures: {}",confirmed_signatures.len());
+        log::debug!("Number of signatures: {}",confirmed_signatures.len().clone());
+        let mut index = 0;
 
-        for signature_info in confirmed_signatures {
+        for signature_info in confirmed_signatures.clone() {
             let tx_hash = signature_info.signature.to_string();
             let signature = Signature::from_str(&tx_hash).expect("Invalid signature format");
 
@@ -43,23 +41,28 @@ impl SolanaTHService {
 
             match client.get_transaction_with_config(&signature, config) {
                 Ok(transaction) => {
-
-                    let raw_message = match &transaction.transaction.transaction {
-                        EncodedTransaction::Json(raw_transaction) => Some(&raw_transaction.message),
-                        _ => None,
-                    };
-
-                    let message = match raw_message.unwrap() {
-                        UiMessage::Raw(message) => Some(message),
-                        _ => None,
-                    }.unwrap();
-
-                    let tx_record = Self::process_transaction(tx_hash,&transaction,&pubkey, &client);
-                    log::info!("TX: {}",tx_record.unwrap());
+                    match Self::process_transaction(tx_hash, &transaction, &pubkey, &client) {
+                        Ok(Some(tx_record)) => {
+                            log::debug!("TX: {}", tx_record);
+                            records.push(tx_record);
+                        }
+                        Ok(None) => {
+                            log::debug!("TX: Skipping empty result");
+                        }
+                        Err(err) => {
+                            log::error!("Error processing transaction: {:?}", err);
+                        }
+                    }
                 }
                 Err(err) => {
-                    println!("Błąd podczas pobierania transakcji: {:?}", err);
+                    log::error!("TX download error: {:?}", err);
                 }
+            }
+            index += 1;
+            log::info!("Processed: {}/{}",index,confirmed_signatures.len());
+            if operation_limit > 0 && index >= operation_limit{
+                log::info!("Limit reached - operation processing finished");
+                break;
             }
         }
 
@@ -71,9 +74,8 @@ impl SolanaTHService {
         tx: &EncodedConfirmedTransactionWithStatusMeta,
         wallet: &Pubkey,
         client: &RpcClient
-    ) -> std::result::Result<TransactionRecord, Box<dyn std::error::Error>> {
+    ) -> std::result::Result<Option<TransactionRecord>, Box<dyn std::error::Error>> {
         log::info!("Process transaction: {}", tx_hash);
-        log::info!("User PK: {}", wallet.to_string());
 
         let block_time = tx.block_time.unwrap_or(0);
         let date = Utc.timestamp_opt(block_time as i64, 0)
@@ -219,6 +221,7 @@ impl SolanaTHService {
         );
         } else {
             log::info!("ELSE: No relevant data found.");
+            return Ok(None);
         }
 
 
@@ -236,7 +239,7 @@ impl SolanaTHService {
             fee_currency: "SOL".to_string(),
         };
 
-        Ok(transaction)
+        Ok(Some(transaction))
     }
 
     fn decode_currency(
@@ -244,8 +247,6 @@ impl SolanaTHService {
         message: &UiRawMessage,
         rpc_client: &RpcClient,
     ) -> String {
-        let token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-
         let account_key = match message.account_keys.get(account_index) {
             Some(key) => key,
             None => return "Unknown".to_string()
