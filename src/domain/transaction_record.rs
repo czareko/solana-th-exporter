@@ -1,7 +1,7 @@
 use std::fmt;
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct TransactionRecord {
     pub date: String,
     pub tx_hash: String,

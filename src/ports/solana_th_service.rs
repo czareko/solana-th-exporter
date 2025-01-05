@@ -2,14 +2,11 @@ use std::str::FromStr;
 use chrono::{TimeZone, Utc};
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcTransactionConfig;
-use solana_sdk::account_info::AccountInfo;
-use solana_sdk::clock::Epoch;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
-use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiMessage, UiRawMessage, UiTransactionEncoding};
+use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiMessage, UiRawMessage, UiTransactionEncoding, UiTransactionStatusMeta};
 use solana_transaction_status::option_serializer::OptionSerializer;
-use spl_token::solana_program::program_pack::Pack;
 use crate::domain::TransactionRecord;
 
 pub struct SolanaTHService;
@@ -73,193 +70,158 @@ impl SolanaTHService {
         tx_hash: String,
         tx: &EncodedConfirmedTransactionWithStatusMeta,
         wallet: &Pubkey,
-        client: &RpcClient
+        client: &RpcClient,
     ) -> std::result::Result<Option<TransactionRecord>, Box<dyn std::error::Error>> {
         log::info!("Process transaction: {}", tx_hash);
 
-        let block_time = tx.block_time.unwrap_or(0);
-        let date = Utc.timestamp_opt(block_time as i64, 0)
-            .unwrap()
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
         let meta = tx.transaction.meta.as_ref().ok_or("Missing transaction metadata")?;
-        let fee_amount = meta.fee as f64 / 1_000_000_000.0;
-
-        let raw_message = match &tx.transaction.transaction {
-            EncodedTransaction::Json(raw_transaction) => &raw_transaction.message,
+        let message = match &tx.transaction.transaction {
+            EncodedTransaction::Json(raw_transaction) => {
+                if let UiMessage::Raw(message) = &raw_transaction.message {
+                    message
+                } else {
+                    return Err("Unsupported message format".into());
+                }
+            }
             _ => return Err("Unsupported transaction encoding".into()),
         };
 
-        let message = match raw_message {
-            UiMessage::Raw(message) => Some(message),
-            _ => None,
-        }.unwrap();
+        let fee_amount = meta.fee as f64 / 1_000_000_000.0;
 
-        let tx_src = message
-            .account_keys
-            .get(0)
-            .map(|account| account.to_string())
-            .unwrap_or_else(|| "n/a".to_string());
+        let (sol_change, token_change,token_mint) = Self::calculate_balance_changes(meta, wallet, message);
 
-        let tx_dest = message
-            .account_keys
-            .get(1)
-            .map(|account| account.to_string())
-            .unwrap_or_else(|| "n/a".to_string());
+        let transaction_type = Self::classify_transaction_type(
+            Some(sol_change).filter(|&x| x.abs() > 0.0),
+            Some(token_change).filter(|&x| x.abs() > 0.0),
+        );
 
-        let system_program_id = "11111111111111111111111111111111";
-        let token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        log::info!(
+        "Detected transaction: Type: {}, SOL Change: {:?}, Token Change: {:?}",
+        transaction_type,
+        sol_change,
+        token_change
+    );
 
-        let mut total_sent_amount: f64 = 0.0;
-        let mut total_received_amount: f64 = 0.0;
-        let mut sent_currency: Option<String> = None;
-        let mut received_currency: Option<String> = None;
+        let transaction = TransactionRecord {
+            date: Self::format_date(tx.block_time.unwrap_or(0) as u64),
+            tx_hash,
+            tx_src: message.account_keys.get(0).cloned().unwrap_or_default(),
+            tx_dest: message.account_keys.get(1).cloned().unwrap_or_default(),
+            sent_amount: if sol_change < 0.0 || token_change < 0.0 {
+                Some(sol_change.min(token_change).abs())
+            } else {
+                None
+            },
+            sent_currency: if sol_change < 0.0 {
+                Some("SOL".to_string())
+            } else if token_change < 0.0 {
+                token_mint.as_ref().and_then(|mint| Self::get_token_symbol(client, mint))
+            } else {
+                None
+            },
+            received_amount: if sol_change > 0.0 || token_change > 0.0 {
+                Some(sol_change.max(token_change))
+            } else {
+                None
+            },
+            received_currency: if sol_change > 0.0 {
+                Some("SOL".to_string())
+            } else if token_change > 0.0 {
+                token_mint.as_ref().and_then(|mint| Self::get_token_symbol(client, mint))
+            } else {
+                None
+            },
+            fee_amount,
+            fee_currency: "SOL".to_string(),
+        };
 
-        for instruction in message.instructions.clone() {
-            if let Some(program_id) = message.account_keys.get(instruction.program_id_index as usize) {
-                if program_id == &system_program_id {
-                    // SOL transfer
-                    if let (Some(source_index), Some(dest_index)) =
-                        (instruction.accounts.get(0), instruction.accounts.get(1))
-                    {
-                        let source = message.account_keys.get(*source_index as usize);
-                        let dest = message.account_keys.get(*dest_index as usize);
+        log::info!("Transaction Record: {}", transaction);
 
-                        if source == Some(&wallet.to_string()) {
-                            if let Some(amount) = meta.pre_balances.get(*source_index as usize) {
-                                total_sent_amount = *amount as f64 / 1_000_000_000.0;
-                            }
-                            sent_currency = Some("SOL".to_string());
-                        }
+        Ok(Some(transaction))
+    }
 
-                        if dest == Some(&wallet.to_string()) {
-                            if let Some(amount) = meta.post_balances.get(*dest_index as usize) {
-                                total_received_amount = *amount as f64 / 1_000_000_000.0;
-                            }
-                            received_currency = Some("SOL".to_string());
-                        }
+    fn calculate_balance_changes(
+        meta: &UiTransactionStatusMeta,
+        wallet: &Pubkey,
+        message: &UiRawMessage,
+    ) -> (f64, f64, Option<String>) {
+        let mut sol_change = 0.0;
+        let mut token_change = 0.0;
+        let mut token_mint = None;
+
+        if let Some(pre_balance) = meta.pre_balances.iter().enumerate().find_map(|(index, &pre)| {
+            message.account_keys.get(index).and_then(|key| {
+                if key == &wallet.to_string() {
+                    Some(pre)
+                } else {
+                    None
+                }
+            })
+        }) {
+            if let Some(post_balance) = meta.post_balances.iter().enumerate().find_map(|(index, &post)| {
+                message.account_keys.get(index).and_then(|key| {
+                    if key == &wallet.to_string() {
+                        Some(post)
+                    } else {
+                        None
                     }
-                } else if program_id == &token_program_id {
-                    // SPL Token transfer
-                    if let (Some(source_index), Some(dest_index)) =
-                        (instruction.accounts.get(0), instruction.accounts.get(1))
-                    {
-                        let source = message.account_keys.get(*source_index as usize);
-                        let dest = message.account_keys.get(*dest_index as usize);
+                })
+            }) {
+                sol_change = (post_balance as f64 - pre_balance as f64) / 1_000_000_000.0;
+            }
+        }
 
-                        if source == Some(&wallet.to_string()) {
-                            match &meta.pre_token_balances {
-                                OptionSerializer::Some(pre_balances) => {
-                                    for balance in pre_balances {
-                                        if let Some(key) = message.account_keys.get(balance.account_index as usize) {
-                                            if let Some(src_key) = message.account_keys.get(*source_index as usize) {
-                                                if key == src_key {
-                                                    if let Some(amount) = balance.ui_token_amount.ui_amount {
-                                                        total_sent_amount = amount;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                },
-                                OptionSerializer::None => {},
-                                OptionSerializer::Skip => {}
-                            }
-                            if total_sent_amount > 0.0 {
-                                sent_currency = Some(Self::decode_currency(*source_index as usize, &message, &client));
-                            }
+        // Oblicz zmiany w tokenach
+        if let (OptionSerializer::Some(pre_token_balances), OptionSerializer::Some(post_token_balances)) =
+            (&meta.pre_token_balances, &meta.post_token_balances)
+        {
+            for (pre_balance, post_balance) in pre_token_balances.iter().zip(post_token_balances.iter())
+            {
+                if let Some(_account_index) = message.account_keys.iter().position(|key| {
+                    key == &wallet.to_string()
+                        && pre_balance.owner == OptionSerializer::Some(wallet.to_string())
+                        && pre_balance.mint == post_balance.mint
+                }) {
+                    let pre_amount = pre_balance.ui_token_amount.ui_amount.unwrap_or(0.0);
+                    let post_amount = post_balance.ui_token_amount.ui_amount.unwrap_or(0.0);
+                    let difference = post_amount - pre_amount;
+                    token_change += difference;
 
-                        }
-
-                        if dest == Some(&wallet.to_string()) {
-                            match &meta.post_token_balances {
-                                OptionSerializer::Some(post_balances) => {
-                                    for balance in post_balances {
-                                        if let Some(key) = message.account_keys.get(balance.account_index as usize) {
-                                            if let Some(dst_key) = message.account_keys.get(*dest_index as usize) {
-                                                if key == dst_key {
-                                                    if let Some(amount) = balance.ui_token_amount.ui_amount {
-                                                        total_received_amount = amount;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                },
-                                OptionSerializer::None => {},
-                                OptionSerializer::Skip => {}
-                            }
-                            if total_received_amount > 0.0{
-                                received_currency = Some(Self::decode_currency(*dest_index as usize, &message, &client));
-                            }
-                        }
+                    if difference != 0.0 {
+                        token_mint = Some(pre_balance.mint.clone());
                     }
                 }
             }
         }
 
-        if total_sent_amount > 0.0 && total_received_amount > 0.0 {
-            log::info!(
-            "TRADE: Total Sent: {:.9} {}, Total Received: {:.9} {}",
-            total_sent_amount,
-            sent_currency.clone().unwrap_or_else(|| "Unknown".to_string()),
-            total_received_amount,
-            received_currency.clone().unwrap_or_else(|| "Unknown".to_string())
-        );
-        } else if total_received_amount > 0.0 {
-            log::info!(
-            "DEPOSIT: Total Received: {:.9} {}",
-            total_received_amount,
-            received_currency.clone().unwrap_or_else(|| "Unknown".to_string())
-        );
-        } else if total_sent_amount > 0.0 {
-            log::info!(
-            "WITHDRAWAL: Total Sent: {:.9} {}",
-            total_sent_amount,
-            sent_currency.clone().unwrap_or_else(|| "Unknown".to_string())
-        );
-        } else {
-            log::info!("ELSE: No relevant data found.");
-            return Ok(None);
-        }
+        // Odejmij opłatę od zmiany SOL
+        let fee = meta.fee as f64 / 1_000_000_000.0;
+        sol_change -= fee;
 
-
-        // Initialize transaction record
-        let transaction = TransactionRecord {
-            date,
-            tx_hash,
-            tx_src,
-            tx_dest,
-            sent_amount: Some(total_sent_amount),
-            sent_currency,
-            received_amount: Some(total_received_amount),
-            received_currency,
-            fee_amount,
-            fee_currency: "SOL".to_string(),
-        };
-
-        Ok(Some(transaction))
+        (sol_change, token_change, token_mint)
     }
 
-    fn decode_currency(
-        account_index: usize,
-        message: &UiRawMessage,
-        rpc_client: &RpcClient,
+    fn classify_transaction_type(
+        sol_difference: Option<f64>,
+        token_difference: Option<f64>,
     ) -> String {
-        let account_key = match message.account_keys.get(account_index) {
-            Some(key) => key,
-            None => return "Unknown".to_string()
-        };
-
-        if let Ok(account) = rpc_client.get_account(&Pubkey::from_str(account_key).unwrap()) {
-            if let Ok(token_account) = spl_token::state::Account::unpack(&account.data) {
-                return Self::get_token_symbol(rpc_client, &token_account.mint.to_string())
-                    .unwrap_or_else(|| "Unknown SPL Token".to_string());
-            }
+        match (sol_difference, token_difference) {
+            (Some(sol), Some(token)) if sol > 0.0 && token < 0.0 => "Token Swap".to_string(),
+            (Some(sol), None) if sol > 0.0 => "SOL Deposit".to_string(),
+            (Some(sol), None) if sol < 0.0 => "SOL Withdrawal".to_string(),
+            (None, Some(token)) if token > 0.0 => "Token Deposit".to_string(),
+            (None, Some(token)) if token < 0.0 => "Token Withdrawal".to_string(),
+            (Some(sol), Some(token)) if sol < 0.0 && token > 0.0 => "Token Purchase".to_string(),
+            _ => "Unknown".to_string(),
         }
+    }
 
-        "Unknown".to_string()
+
+    fn format_date(timestamp: u64) -> String {
+        match Utc.timestamp_opt(timestamp as i64, 0) {
+            chrono::LocalResult::Single(datetime) => datetime.format("%Y-%m-%d %H:%M:%S").to_string(),
+            _ => "1970-01-01 00:00:00".to_string(),
+        }
     }
 
     fn get_token_symbol(client: &RpcClient, mint_address: &str) -> Option<String> {
@@ -271,26 +233,19 @@ impl SolanaTHService {
         let seeds = &[
             b"metadata".as_ref(),
             program_id.as_ref(),
-            mint.as_ref()
+            mint.as_ref(),
         ];
 
         let (metadata_pda, _) = Pubkey::find_program_address(seeds, &program_id);
 
-        let mut metadata_account = client.get_account(&metadata_pda).ok()?;
-        let mut lamports = metadata_account.lamports;
-        let account_info = AccountInfo::new(
-            &metadata_pda,
-            false,
-            false,
-            &mut lamports,
-            &mut metadata_account.data[..],
-            &program_id,
-            false,
-            Epoch::default(),
-        );
+        if let Ok(account) = client.get_account(&metadata_pda) {
+            if let Ok(metadata) =
+                mpl_token_metadata::accounts::Metadata::safe_deserialize(&account.data)
+            {
+                return Some(metadata.symbol.trim().to_string());
+            }
+        }
 
-        let metadata = mpl_token_metadata::accounts::Metadata::try_from(&account_info).ok()?;
-        Some(metadata.symbol)
+        None
     }
-
 }
